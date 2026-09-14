@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   CalendarDays,
@@ -43,12 +43,22 @@ import {
   MEAL_TYPES,
   type GlucoseContext,
   type MealRecord,
+  type MealType,
+  type ReadingRecord,
   type RecordsResponse,
 } from "@/lib/records";
+import {
+  createDeviceId,
+  loadDeviceRecords,
+  makeBackup,
+  readBackup,
+  saveDeviceRecords,
+} from "@/lib/device-records";
 
 type EntryDialog = "glucose" | "meal" | null;
 type Period = "7d" | "30d" | "month" | "all";
 type DeleteTarget = { id: string; type: "meal" | "reading"; label: string } | null;
+type PendingImport = { name: string; records: RecordsResponse } | null;
 
 const dateTimeFormatter = new Intl.DateTimeFormat("pt-BR", {
   day: "2-digit",
@@ -100,13 +110,13 @@ function periodLabel(period: Period, month: string) {
   );
 }
 
-async function responseError(response: Response) {
-  try {
-    const data = (await response.json()) as { error?: string };
-    return data.error || "Não foi possível concluir a operação.";
-  } catch {
-    return "Não foi possível concluir a operação.";
-  }
+function recordsForRange(records: RecordsResponse, period: Period, month: string): RecordsResponse {
+  const { start, end } = rangeFor(period, month);
+  const inRange = (occurredAt: string) => (!start || occurredAt >= start) && (!end || occurredAt <= end);
+  return {
+    meals: records.meals.filter((record) => inRange(record.occurredAt)),
+    readings: records.readings.filter((record) => inRange(record.occurredAt)),
+  };
 }
 
 export function LuizaDashboard() {
@@ -119,123 +129,107 @@ export function LuizaDashboard() {
   const [notice, setNotice] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget>(null);
   const [deleting, setDeleting] = useState(false);
+  const [pendingImport, setPendingImport] = useState<PendingImport>(null);
+  const backupInputRef = useRef<HTMLInputElement>(null);
 
   const fetchRecords = useCallback(async () => {
     setLoading(true);
     setLoadError("");
     try {
-      const params = new URLSearchParams(rangeFor(period, month));
-      const response = await fetch(`/api/records?${params.toString()}`, { cache: "no-store" });
-      if (!response.ok) throw new Error(await responseError(response));
-      setRecords((await response.json()) as RecordsResponse);
-    } catch (error) {
-      setLoadError(error instanceof Error ? error.message : "Não foi possível carregar os registros.");
+      setRecords(loadDeviceRecords());
+    } catch {
+      setLoadError("Não foi possível abrir os registros guardados neste aparelho.");
     } finally {
       setLoading(false);
     }
-  }, [month, period]);
+  }, []);
 
   useEffect(() => {
     const timer = window.setTimeout(() => void fetchRecords(), 0);
     return () => window.clearTimeout(timer);
   }, [fetchRecords]);
 
-  useEffect(() => {
-    const context = (document as Document & {
-      modelContext?: {
-        registerTool: (tool: Record<string, unknown>, options?: { signal?: AbortSignal }) => void | Promise<void>;
-      };
-    }).modelContext;
-    if (!context?.registerTool) return;
-    const lifecycle = new AbortController();
-    const register = (tool: Record<string, unknown>) => {
-      void Promise.resolve(context.registerTool(tool, { signal: lifecycle.signal })).catch(() => undefined);
-    };
-
-    register({
-      name: "registrar_glicose",
-      title: "Registrar glicose",
-      description: "Registra uma medição de glicose da Luiza e atualiza o histórico visível.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          value: { type: "integer", minimum: 1, description: "Valor em mg/dL" },
-          occurredAt: { type: "string", description: "Data e hora em formato ISO" },
-          context: { type: "string", enum: Object.keys(GLUCOSE_CONTEXTS) },
-          customContext: { type: "string" },
-          mealId: { type: "string" },
-          notes: { type: "string" },
-        },
-        required: ["value", "occurredAt", "context"],
-        additionalProperties: false,
-      },
-      annotations: { readOnlyHint: false, untrustedContentHint: false },
-      execute: async (input: unknown) => {
-        const response = await fetch("/api/records", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ type: "reading", ...(input as object) }),
-        });
-        if (!response.ok) throw new Error(await responseError(response));
-        await fetchRecords();
-        return { status: "registrado" };
-      },
-    });
-    register({
-      name: "registrar_refeicao",
-      title: "Registrar refeição",
-      description: "Registra uma refeição da Luiza e atualiza o histórico visível.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          occurredAt: { type: "string", description: "Data e hora em formato ISO" },
-          mealType: { type: "string", enum: Object.keys(MEAL_TYPES) },
-          foods: { type: "array", items: { type: "string" }, minItems: 1 },
-          notes: { type: "string" },
-        },
-        required: ["occurredAt", "mealType", "foods"],
-        additionalProperties: false,
-      },
-      annotations: { readOnlyHint: false, untrustedContentHint: false },
-      execute: async (input: unknown) => {
-        const response = await fetch("/api/records", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ type: "meal", ...(input as object) }),
-        });
-        if (!response.ok) throw new Error(await responseError(response));
-        await fetchRecords();
-        return { status: "registrada" };
-      },
-    });
-    return () => lifecycle.abort();
-  }, [fetchRecords]);
-
+  const visibleRecords = useMemo(() => recordsForRange(records, period, month), [month, period, records]);
   const patterns = useMemo(
-    () => findFoodPatterns(records.meals, records.readings),
-    [records.meals, records.readings],
+    () => findFoodPatterns(visibleRecords.meals, visibleRecords.readings),
+    [visibleRecords.meals, visibleRecords.readings],
   );
 
   const timeline = useMemo(() => {
-    const mealItems = records.meals.map((item) => ({ ...item, kind: "meal" as const }));
-    const readingItems = records.readings.map((item) => ({ ...item, kind: "reading" as const }));
+    const mealItems = visibleRecords.meals.map((item) => ({ ...item, kind: "meal" as const }));
+    const readingItems = visibleRecords.readings.map((item) => ({ ...item, kind: "reading" as const }));
     return [...mealItems, ...readingItems].sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
-  }, [records]);
+  }, [visibleRecords]);
 
   async function removeRecord() {
     if (!deleteTarget) return;
     setDeleting(true);
     try {
-      const params = new URLSearchParams({ id: deleteTarget.id, type: deleteTarget.type });
-      const response = await fetch(`/api/records?${params}`, { method: "DELETE" });
-      if (!response.ok) throw new Error(await responseError(response));
+      const nextRecords: RecordsResponse = deleteTarget.type === "meal"
+        ? { ...records, meals: records.meals.filter((record) => record.id !== deleteTarget.id) }
+        : { ...records, readings: records.readings.filter((record) => record.id !== deleteTarget.id) };
+      saveDeviceRecords(nextRecords);
+      setRecords(nextRecords);
       setDeleteTarget(null);
       setNotice("Registro excluído.");
-      await fetchRecords();
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Não foi possível excluir.");
+    } catch {
+      setNotice("Não foi possível excluir neste aparelho. Tente novamente.");
     } finally {
       setDeleting(false);
+    }
+  }
+
+  function saveNewRecord(record: MealRecord | ReadingRecord, type: "meal" | "reading") {
+    const nextRecords: RecordsResponse = type === "meal"
+      ? { ...records, meals: [...records.meals, record as MealRecord] }
+      : { ...records, readings: [...records.readings, record as ReadingRecord] };
+    saveDeviceRecords(nextRecords);
+    setRecords(nextRecords);
+    setDialog(null);
+    setNotice(type === "meal" ? "Refeição registrada neste aparelho." : "Medição registrada neste aparelho.");
+  }
+
+  function downloadBackup() {
+    try {
+      const backup = makeBackup(records);
+      const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `backup-diario-luiza-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      setNotice("Backup baixado. Guarde o arquivo em Arquivos ou iCloud Drive.");
+    } catch {
+      setNotice("Não foi possível criar o backup agora.");
+    }
+  }
+
+  async function chooseBackup(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      const restoredRecords = readBackup(JSON.parse(await file.text()));
+      if (!restoredRecords) throw new Error("invalid backup");
+      setPendingImport({ name: file.name, records: restoredRecords });
+    } catch {
+      setNotice("Este arquivo não parece ser um backup válido do Diário da Luiza.");
+    }
+  }
+
+  function importBackup() {
+    if (!pendingImport) return;
+    try {
+      saveDeviceRecords(pendingImport.records);
+      setRecords(pendingImport.records);
+      setPendingImport(null);
+      setNotice("Backup restaurado neste aparelho.");
+    } catch {
+      setPendingImport(null);
+      setNotice("Não foi possível restaurar o backup agora.");
     }
   }
 
@@ -270,7 +264,7 @@ export function LuizaDashboard() {
       doc.setTextColor(70, 89, 103);
       addText(`Glicose e alimentação • ${periodLabel(period, month)}`, 11, false, 8);
       doc.setTextColor(20, 34, 51);
-      addText(`${records.readings.length} medições • ${records.meals.length} refeições registradas`, 11, true, 8);
+      addText(`${visibleRecords.readings.length} medições • ${visibleRecords.meals.length} refeições registradas`, 11, true, 8);
 
       addText("Possíveis padrões observados", 14, true, 4);
       if (patterns.length === 0) {
@@ -340,11 +334,17 @@ export function LuizaDashboard() {
               <p className="font-semibold tracking-tight">Glicose & alimentação</p>
             </div>
           </div>
-          <Button variant="outline" className="rounded-xl border-primary/20" onClick={() => void generatePdf()}>
-            <FileText aria-hidden="true" />
-            <span className="hidden sm:inline">Gerar PDF</span>
-            <span className="sm:hidden">PDF</span>
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" className="rounded-xl border-primary/20" onClick={downloadBackup}>
+              <FileDown aria-hidden="true" />
+              <span className="hidden sm:inline">Backup</span>
+            </Button>
+            <Button variant="outline" className="rounded-xl border-primary/20" onClick={() => void generatePdf()}>
+              <FileText aria-hidden="true" />
+              <span className="hidden sm:inline">Gerar PDF</span>
+              <span className="sm:hidden">PDF</span>
+            </Button>
+          </div>
         </div>
       </header>
 
@@ -414,7 +414,7 @@ export function LuizaDashboard() {
             <div className="mb-4 flex items-center justify-between">
               <div>
                 <h2 className="text-xl font-bold tracking-tight">Seus registros</h2>
-                {!loading && !loadError && <p className="mt-1 text-sm text-muted-foreground">{records.readings.length} medições e {records.meals.length} refeições</p>}
+                {!loading && !loadError && <p className="mt-1 text-sm text-muted-foreground">{visibleRecords.readings.length} medições e {visibleRecords.meals.length} refeições</p>}
               </div>
               <Button variant="ghost" size="icon-sm" aria-label="Atualizar registros" onClick={() => void fetchRecords()}>
                 <RefreshCw className={loading ? "animate-spin" : ""} />
@@ -505,6 +505,16 @@ export function LuizaDashboard() {
             <p className="mt-2 text-sm leading-6 text-white/68">O PDF usa apenas o período selecionado e inclui os registros e as possíveis associações observadas.</p>
             <Button className="mt-5 w-full rounded-xl bg-white text-ink hover:bg-white/90" onClick={() => void generatePdf()}>Gerar e compartilhar PDF</Button>
           </section>
+
+          <section className="rounded-3xl border border-border bg-white p-5 shadow-sm">
+            <h2 className="text-lg font-bold">Backup deste aparelho</h2>
+            <p className="mt-2 text-sm leading-6 text-muted-foreground">Os registros ficam só neste aparelho. Baixe um backup para guardar no Arquivos ou iCloud Drive e restaurar se trocar de celular.</p>
+            <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-1">
+              <Button variant="outline" className="rounded-xl" onClick={downloadBackup}>Baixar backup</Button>
+              <Button variant="outline" className="rounded-xl" onClick={() => backupInputRef.current?.click()}>Restaurar backup</Button>
+              <input ref={backupInputRef} type="file" accept="application/json,.json" className="sr-only" onChange={(event) => void chooseBackup(event)} />
+            </div>
+          </section>
         </aside>
       </div>
 
@@ -512,7 +522,7 @@ export function LuizaDashboard() {
         kind={dialog}
         meals={records.meals}
         onClose={() => setDialog(null)}
-        onSaved={async (message) => { setDialog(null); setNotice(message); await fetchRecords(); }}
+        onSaved={saveNewRecord}
       />
 
       <AlertDialog open={deleteTarget !== null} onOpenChange={(open) => !open && setDeleteTarget(null)}>
@@ -529,6 +539,19 @@ export function LuizaDashboard() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <AlertDialog open={pendingImport !== null} onOpenChange={(open) => !open && setPendingImport(null)}>
+        <AlertDialogContent className="rounded-3xl">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Restaurar este backup?</AlertDialogTitle>
+            <AlertDialogDescription>O arquivo {pendingImport?.name} substituirá os registros atualmente guardados neste aparelho.</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancelar</AlertDialogCancel>
+            <AlertDialogAction onClick={importBackup}>Restaurar backup</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </main>
   );
 }
@@ -542,7 +565,7 @@ function EntryFormDialog({
   kind: EntryDialog;
   meals: MealRecord[];
   onClose: () => void;
-  onSaved: (message: string) => Promise<void>;
+  onSaved: (record: MealRecord | ReadingRecord, type: "meal" | "reading") => void;
 }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -556,30 +579,39 @@ function EntryFormDialog({
     try {
       const occurredAtValue = String(form.get("occurredAt") || "");
       const occurredAt = new Date(occurredAtValue).toISOString();
-      const payload = kind === "glucose"
-        ? {
-            type: "reading",
-            value: Number(form.get("value")),
-            occurredAt,
-            context: form.get("context"),
-            customContext: form.get("customContext"),
-            mealId: form.get("mealId"),
-            notes: form.get("notes"),
-          }
-        : {
-            type: "meal",
-            occurredAt,
-            mealType: form.get("mealType"),
-            foods: String(form.get("foods") || "").split(/[,;\n]/).map((item) => item.trim()).filter(Boolean),
-            notes: form.get("notes"),
-          };
-      const response = await fetch("/api/records", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      if (!response.ok) throw new Error(await responseError(response));
-      await onSaved(kind === "glucose" ? "Medição registrada." : "Refeição registrada.");
+      if (!kind || !Number.isFinite(Date.parse(occurredAt))) throw new Error("Confira a data e a hora.");
+
+      if (kind === "glucose") {
+        const value = Number(form.get("value"));
+        const context = String(form.get("context") || "");
+        const customContext = String(form.get("customContext") || "").trim().slice(0, 120);
+        const mealId = String(form.get("mealId") || "") || null;
+        if (!Number.isInteger(value) || value < 1 || value > 9999 || !(context in GLUCOSE_CONTEXTS)) {
+          throw new Error("Confira o valor e o contexto da medição.");
+        }
+        if (context === "other" && !customContext) throw new Error("Descreva o contexto personalizado.");
+        if (mealId && !meals.some((meal) => meal.id === mealId)) throw new Error("A refeição escolhida não foi encontrada.");
+        onSaved({
+          id: createDeviceId(),
+          value,
+          occurredAt,
+          context: context as GlucoseContext,
+          customContext: context === "other" ? customContext : null,
+          mealId,
+          notes: String(form.get("notes") || "").trim().slice(0, 1000),
+        }, "reading");
+      } else {
+        const mealType = String(form.get("mealType") || "");
+        const foods = String(form.get("foods") || "").split(/[,;\n]/).map((item) => item.trim()).filter(Boolean).slice(0, 30);
+        if (!(mealType in MEAL_TYPES) || foods.length === 0) throw new Error("Confira o tipo de refeição e os alimentos.");
+        onSaved({
+          id: createDeviceId(),
+          occurredAt,
+          mealType: mealType as MealType,
+          foods,
+          notes: String(form.get("notes") || "").trim().slice(0, 1000),
+        }, "meal");
+      }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Não foi possível salvar.");
     } finally {
