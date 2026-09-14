@@ -33,10 +33,16 @@ jobs:
           NEXT_PUBLIC_ASSET_PREFIX: /diario-da-luiza
       - name: Preparar GitHub Pages
         uses: actions/configure-pages@v5
+      - name: Organizar arquivos para a URL do projeto
+        run: |
+          mkdir .pages-artifact
+          cp -R dist/client/. .pages-artifact/
+          cp -R dist/client/diario-da-luiza/_next .pages-artifact/_next
+          rm -rf .pages-artifact/diario-da-luiza
       - name: Enviar site pronto
         uses: actions/upload-pages-artifact@v4
         with:
-          path: ./dist/client
+          path: ./.pages-artifact
 
   deploy:
     environment:
