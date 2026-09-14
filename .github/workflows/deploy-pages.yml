@@ -29,6 +29,8 @@ jobs:
         run: npm ci
       - name: Gerar site estático
         run: npm run build
+        env:
+          NEXT_PUBLIC_ASSET_PREFIX: /diario-da-luiza
       - name: Preparar GitHub Pages
         uses: actions/configure-pages@v5
       - name: Enviar site pronto
